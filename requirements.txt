@@ -1,0 +1,11 @@
+# gemsearch - Linux + NVIDIA CUDA
+# Install torch/torchvision first if you need a specific CUDA build (see README), then:
+#   uv pip install -r requirements.txt
+torch>=2.7
+torchvision>=0.22                  # used by the model's image/video processor
+transformers>=5.19                 # first release with EmbeddingGemma 2 support
+sentence-transformers>=6.1.0       # multimodal encode + processing_kwargs
+accelerate
+numpy
+pillow>=10
+pillow-heif                        # HEIC / HEIF support
