@@ -7,5 +7,5 @@ transformers>=5.19                 # first release with EmbeddingGemma 2 support
 sentence-transformers>=6.1.0       # multimodal encode + processing_kwargs
 accelerate
 numpy
-pillow>=10
+pillow>=11.2                       # >=11.2 for native AVIF support
 pillow-heif                        # HEIC / HEIF support

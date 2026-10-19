@@ -117,12 +117,29 @@ class App:
             q = qvec_fn(snap)
         t1 = time.perf_counter()
         exclude = snap.row_by_rel.get(exclude_rel) if exclude_rel else None
-        hits = gs.rank(snap.vecs(dim), gs.truncate(q, dim), k, exclude)
+        vecs = snap.vecs(dim)
+        q_trunc = gs.truncate(q, dim)
+        s = vecs @ q_trunc
+        if exclude is not None:
+            valid = np.delete(s, exclude)
+        else:
+            valid = s
+        if len(valid):
+            med = float(np.median(valid))
+            mad = max(float(np.median(np.abs(valid - med))) * 1.4826, 1e-6)
+        else:
+            med, mad = 0.0, 1.0
+        hits = gs.rank(vecs, q_trunc, k, exclude)
         t2 = time.perf_counter()
-        return {"results": [{"rel": snap.idx.rels[r], "score": s} for r, s in hits],
-                "count": len(snap.idx.rels), "dim": dim,
-                "encode_ms": round(1000 * (t1 - t0), 1), "rank_ms": round(1000 * (t2 - t1), 2)}
-
+        return {
+            "results": [
+                {"rel": snap.idx.rels[r], "score": sc, "z": round((sc - med) / mad, 2)}
+                for r, sc in hits
+            ],
+            "baseline": {"med": round(med, 3), "mad": round(mad, 3)},
+            "count": len(snap.idx.rels), "dim": dim,
+            "encode_ms": round(1000 * (t1 - t0), 1), "rank_ms": round(1000 * (t2 - t1), 2),
+        }
 
 def make_handler(app, allowed_hosts):
     class Handler(BaseHTTPRequestHandler):
@@ -336,6 +353,13 @@ main{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:
   <button type="button" id="drop" title="Choose, drop or paste an image">By image...</button>
   <button type="button" id="brw" title="Browse indexed photos">Browse</button>
   <input id="file" type="file" accept="image/*" hidden>
+  <label>cutoff <select id="cut" title="Filter tail results using largest score drop (cliff) or robust Median/MAD z-score">
+    <option value="cliff" selected>Auto (cliff)</option>
+    <option value="3.5">Strict (&gt;3.5σ)</option>
+    <option value="2.5">Medium (&gt;2.5σ)</option>
+    <option value="1.8">Loose (&gt;1.8σ)</option>
+    <option value="0">Off (all)</option>
+  </select></label>
   <label>dim <select id="dim"><option>768</option><option>512</option><option>256</option><option>128</option></select></label>
   <label>show <select id="k"><option>24</option><option>48</option><option>96</option><option>200</option></select></label>
 </form>
@@ -343,10 +367,10 @@ main{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:
 </header>
 <main id="grid"></main>
 <div id="lb"><img id="lbimg" alt=""><p id="lbcap"></p>
-  <div><button id="sim">Find similar</button> <button id="cls">Close</button></div></div>
+  <div><button id="prv" title="Previous (Left Arrow)">&#9664; Prev</button> <button id="sim">Find similar</button> <button id="cls">Close</button> <button id="nxt" title="Next (Right Arrow)">Next &#9654;</button></div></div>
 <script>
 const $ = id => document.getElementById(id);
-let info = null, current = null, lastRun = null, activeFile = null, activeRel = null;
+let info = null, current = null, currentIdx = -1, shownList = [], lastRun = null, lastData = null, lastLabel = '', activeFile = null, activeRel = null;
 const status = t => { $('status').textContent = t; };
 const params = extra => new URLSearchParams({k: $('k').value, dim: $('dim').value, ...extra});
 
@@ -373,23 +397,51 @@ async function run(label, req) {
     const r = await req();
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.statusText);
+    lastData = j; lastLabel = label;
     render(j, label);
   } catch (e) { status('Error: ' + e.message); }
 }
 
+function applyCutoff(all, base, mode) {
+  if (!base || mode === '0' || all.length <= 1 || all[0].z == null) return all;
+  if (mode === 'cliff') {
+    const above = all.filter(r => r.z >= 2.2);
+    const pool = above.length >= 2 ? above : all;
+    let bestIdx = -1, maxDrop = 0;
+    for (let i = 0; i < pool.length - 1; i++) {
+      const drop = pool[i].score - pool[i + 1].score;
+      if (drop > maxDrop) { maxDrop = drop; bestIdx = i; }
+    }
+    if (bestIdx >= 0 && maxDrop >= 0.5 * (base.mad || 0.02)) return pool.slice(0, bestIdx + 1);
+    return above.length ? above : [all[0]];
+  }
+  const minZ = parseFloat(mode || '0');
+  const filtered = all.filter(r => r.z >= minZ);
+  return filtered.length ? filtered : [all[0]];
+}
+
 function render(j, label) {
   const g = $('grid'); g.replaceChildren();
-  for (const r of j.results) {
+  const mode = $('cut').value || '0';
+  const all = j.results || [];
+  const shown = applyCutoff(all, j.baseline, mode);
+  shownList = shown;
+  const hidden = all.length - shown.length;
+  shown.forEach((r, idx) => {
     const c = document.createElement('button'); c.className = 'card'; c.type = 'button';
     const im = document.createElement('img'); im.loading = 'lazy'; im.alt = '';
     im.src = '/thumb?p=' + encodeURIComponent(r.rel);
     const n = document.createElement('div'); n.className = 'n'; n.textContent = r.rel; n.title = r.rel;
     const s = document.createElement('div'); s.className = 's';
-    s.textContent = r.score == null ? '' : r.score.toFixed(3);
-    c.append(im, n, s); c.onclick = () => openLb(r.rel); g.append(c);
-  }
+    s.textContent = r.score == null ? '' : `${r.score.toFixed(3)}` + (r.z != null ? ` (+${r.z.toFixed(1)}σ)` : '');
+    c.append(im, n, s); c.onclick = () => openLb(idx); g.append(c);
+  });
   const gpu = info ? ` | budget ${info.budget}` : '';
-  status(`${label}: ${j.results.length} of ${j.count} | dim ${j.dim}${gpu} | encode ${j.encode_ms} ms, rank ${j.rank_ms} ms`);
+  const m = j.baseline ? (j.baseline.med ?? j.baseline.mean) : null;
+  const d = j.baseline ? (j.baseline.mad ?? j.baseline.std) : null;
+  const base = (m != null && d != null) ? ` | med ${m.toFixed(3)}±${d.toFixed(3)}` : '';
+  const hidNote = hidden > 0 ? ` (${hidden} below cutoff)` : '';
+  status(`${label}: ${shown.length}${hidNote} of ${j.count} | dim ${j.dim}${gpu}${base} | encode ${j.encode_ms} ms, rank ${j.rank_ms} ms`);
 }
 
 function textSearch() {
@@ -419,18 +471,30 @@ function imageSearch(file) {
       {method: 'POST', headers: {'Content-Type': file.type}, body: file}));
 }
 
-function openLb(rel) {
-  current = rel; $('lbimg').src = '/img?p=' + encodeURIComponent(rel);
-  $('lbcap').textContent = rel; $('lb').classList.add('on');
+function openLb(idx) {
+  if (!shownList.length) return;
+  currentIdx = ((idx % shownList.length) + shownList.length) % shownList.length;
+  const r = shownList[currentIdx];
+  current = r.rel;
+  $('lbimg').src = '/img?p=' + encodeURIComponent(r.rel);
+  const sc = r.score == null ? '' : ` — ${r.score.toFixed(3)}` + (r.z != null ? ` (+${r.z.toFixed(1)}σ)` : '');
+  $('lbcap').textContent = `[${currentIdx + 1} / ${shownList.length}] ${r.rel}${sc}`;
+  $('lb').classList.add('on');
+}
+function stepLb(delta) {
+  if ($('lb').classList.contains('on') && shownList.length) openLb(currentIdx + delta);
 }
 function closeLb() { $('lb').classList.remove('on'); $('lbimg').removeAttribute('src'); }
 
 $('f').onsubmit = e => { e.preventDefault(); textSearch(); };
 $('dim').onchange = $('k').onchange = () => { if (lastRun) run(...lastRun); };
+$('cut').onchange = () => { if (lastData) render(lastData, lastLabel); };
 $('drop').onclick = () => $('file').click();
 $('brw').onclick = browse;
 $('qimg').onclick = () => { clearImage(); if ($('q').value.trim()) textSearch(); else browse(); };
 $('file').onchange = e => imageSearch(e.target.files[0]);
+$('prv').onclick = () => stepLb(-1);
+$('nxt').onclick = () => stepLb(1);
 $('cls').onclick = closeLb;
 $('lb').onclick = e => { if (e.target.id === 'lb') closeLb(); };
 $('sim').onclick = () => {
@@ -442,7 +506,12 @@ $('sim').onclick = () => {
   const lbl = 'similar to ' + rel + (q ? ` + "${q}"` : '');
   run(lbl, () => fetch('/api/similar?' + params(q ? {p: rel, q} : {p: rel})));
 };
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLb(); });
+document.addEventListener('keydown', e => {
+  if (!$('lb').classList.contains('on')) return;
+  if (e.key === 'Escape') closeLb();
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); stepLb(-1); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); stepLb(1); }
+});
 document.addEventListener('dragover', e => { e.preventDefault(); $('drop').classList.add('over'); });
 document.addEventListener('dragleave', () => $('drop').classList.remove('over'));
 document.addEventListener('drop', e => {
